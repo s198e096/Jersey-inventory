@@ -181,6 +181,156 @@ def delete_sale(sale_id):
     if not sb.table("sales").select("id").eq("id",int(sale_id)).execute().data: raise ValueError("Sale not found.")
     sb.table("sales").delete().eq("id",int(sale_id)).execute()
 
+
+# ----------------------------
+# Voice sale helpers
+# ----------------------------
+def transcribe_sale_audio(audio_file):
+    """Transcribe a short recorded sale description."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("The openai package is not installed. Run: pip install -r requirements.txt")
+
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+    client = OpenAI(api_key=api_key)
+
+    # st.audio_input returns a file-like UploadedFile (WAV).
+    audio_file.seek(0)
+    transcript = client.audio.transcriptions.create(
+        model="gpt-4o-mini-transcribe",
+        file=audio_file,
+    )
+    return transcript.text.strip()
+
+
+def parse_voice_sale(transcript, available_inventory):
+    """
+    Convert a voice transcript into sale fields, using current inventory as
+    grounding so team/player/size names are matched to items that actually exist.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("The openai package is not installed. Run: pip install -r requirements.txt")
+
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+    client = OpenAI(api_key=api_key)
+
+    # Give the model only the inventory choices it needs for matching.
+    choices = []
+    grouped = (
+        available_inventory[
+            ["team", "player_name", "jersey_number", "version", "size", "quantity_in_stock"]
+        ]
+        .fillna("")
+        .groupby(
+            ["team", "player_name", "jersey_number", "version", "size"],
+            as_index=False,
+            dropna=False
+        )["quantity_in_stock"]
+        .sum()
+    )
+
+    for _, r in grouped.iterrows():
+        if int(r["quantity_in_stock"]) > 0:
+            choices.append({
+                "team": str(r["team"]),
+                "player_name": str(r["player_name"]),
+                "jersey_number": str(r["jersey_number"]),
+                "version": str(r["version"]),
+                "size": str(r["size"]),
+                "quantity_in_stock": int(r["quantity_in_stock"]),
+            })
+
+    prompt = f"""
+You extract a jersey sale from a short voice transcript.
+
+VOICE TRANSCRIPT:
+{transcript}
+
+CURRENT AVAILABLE INVENTORY:
+{json.dumps(choices, ensure_ascii=False)}
+
+Return JSON only in this exact shape:
+{{
+  "team": "",
+  "player_name": "",
+  "jersey_number": "",
+  "version": "",
+  "size": "",
+  "quantity": 1,
+  "sale_price_each": 0.0,
+  "fees": 0.0,
+  "shipping_cost": 0.0,
+  "notes": "",
+  "match_confidence": "high"
+}}
+
+Rules:
+1. Match team/player/number/version/size to CURRENT AVAILABLE INVENTORY whenever possible.
+2. The spoken price is the SALE PRICE PER JERSEY unless the speaker explicitly says it is a total.
+3. If quantity is not spoken, use 1.
+4. If fees or shipping are not spoken, use 0.
+5. Never invent a team, player, size, or price that was not spoken or strongly matched to inventory.
+6. If the transcript is ambiguous, choose the closest inventory match but set match_confidence to "low".
+7. Normalize common size speech: small=S, medium=M, large=L, extra large=XL, double XL=XXL.
+8. Return JSON only, no markdown.
+"""
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+    )
+    result = extract_json(response.output_text)
+
+    # Defensive normalization
+    result["quantity"] = int(result.get("quantity", 1) or 1)
+    result["sale_price_each"] = float(result.get("sale_price_each", 0) or 0)
+    result["fees"] = float(result.get("fees", 0) or 0)
+    result["shipping_cost"] = float(result.get("shipping_cost", 0) or 0)
+    return result
+
+
+def voice_product_match_index(products, parsed):
+    """Return the best exact-ish product index for the parsed voice sale."""
+    if products.empty:
+        return 0
+
+    def norm(x):
+        return str(x or "").strip().lower()
+
+    best_idx = 0
+    best_score = -1
+
+    for idx, row in products.iterrows():
+        score = 0
+        for col, weight in [
+            ("team", 4),
+            ("player_name", 5),
+            ("jersey_number", 3),
+            ("version", 1),
+        ]:
+            p = norm(parsed.get(col, ""))
+            r = norm(row[col])
+            if p and r and p == r:
+                score += weight
+            elif p and r and (p in r or r in p):
+                score += max(1, weight - 2)
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return int(best_idx)
+
+
 # ----------------------------
 # OpenAI image extraction
 # ----------------------------
@@ -209,10 +359,11 @@ def parse_order_sheet(uploaded_file):
     except ImportError:
         raise RuntimeError("The openai package is not installed. Run: pip install -r requirements.txt")
 
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key)
 
     prompt = """
 You are reading a soccer/football jersey supplier order sheet from an image.
@@ -583,6 +734,187 @@ with tabs[3]:
                 who = f"{who} #{number}".strip()
             parts = [str(r["team"]).strip(), who, str(r["version"]).strip()]
             return " — ".join([p for p in parts if p]) or "Unnamed jersey"
+
+        # -------------------------------------------------
+        # Voice sale
+        # -------------------------------------------------
+        st.markdown("### 🎙️ Record sale by voice")
+        st.caption(
+            'Example: "Sold one Barcelona Lamine Yamal, size medium, for 45 dollars."'
+        )
+
+        voice_audio = st.audio_input(
+            "Tap the microphone and describe the sale",
+            key="voice_sale_audio"
+        )
+
+        if voice_audio is not None:
+            if st.button("Process voice sale", type="primary", key="process_voice_sale"):
+                with st.spinner("Listening and matching it to your inventory..."):
+                    try:
+                        transcript = transcribe_sale_audio(voice_audio)
+                        parsed = parse_voice_sale(transcript, available)
+                        st.session_state["voice_sale_transcript"] = transcript
+                        st.session_state["voice_sale_parsed"] = parsed
+                    except Exception as e:
+                        st.error(str(e))
+
+        if "voice_sale_parsed" in st.session_state:
+            parsed = st.session_state["voice_sale_parsed"]
+            transcript = st.session_state.get("voice_sale_transcript", "")
+
+            st.success(f'Heard: "{transcript}"')
+
+            if str(parsed.get("match_confidence", "")).lower() == "low":
+                st.warning("The inventory match may be uncertain. Please verify the fields below.")
+
+            st.markdown("#### Confirm sale details")
+
+            product_labels = [product_label(r) for _, r in products.iterrows()]
+            default_product_idx = voice_product_match_index(products, parsed)
+
+            voice_product_idx = st.selectbox(
+                "Jersey",
+                options=list(range(len(products))),
+                index=min(default_product_idx, len(products) - 1),
+                format_func=lambda i: product_labels[i],
+                key="voice_confirm_product"
+            )
+            voice_product_row = products.iloc[int(voice_product_idx)]
+
+            voice_product_mask = pd.Series(True, index=available.index)
+            for col in pcols:
+                voice_product_mask &= (
+                    available[col].fillna("").astype(str)
+                    == str(voice_product_row[col] or "")
+                )
+            voice_product_stock = available[voice_product_mask].copy()
+
+            voice_size_stock = (
+                voice_product_stock.assign(
+                    size=voice_product_stock["size"].fillna("").astype(str).str.upper()
+                )
+                .groupby("size", dropna=False, as_index=False)["quantity_in_stock"]
+                .sum()
+            )
+            voice_size_stock = voice_size_stock[voice_size_stock["quantity_in_stock"] > 0]
+
+            voice_sizes = voice_size_stock["size"].tolist()
+            parsed_size = normalize_size(parsed.get("size", ""))
+            voice_size_index = (
+                voice_sizes.index(parsed_size)
+                if parsed_size in voice_sizes
+                else 0
+            )
+
+            voice_size = st.selectbox(
+                "Size",
+                voice_sizes,
+                index=voice_size_index,
+                format_func=lambda s: (
+                    f"{s or 'Unspecified'} — "
+                    f"{int(voice_size_stock.loc[voice_size_stock['size'] == s, 'quantity_in_stock'].iloc[0])} in stock"
+                ),
+                key="voice_confirm_size"
+            )
+
+            voice_stock = int(
+                voice_size_stock.loc[
+                    voice_size_stock["size"] == voice_size,
+                    "quantity_in_stock"
+                ].iloc[0]
+            )
+
+            vc1, vc2 = st.columns(2)
+            voice_qty = vc1.number_input(
+                "Quantity sold",
+                min_value=1,
+                max_value=voice_stock,
+                value=min(max(int(parsed.get("quantity", 1)), 1), voice_stock),
+                step=1,
+                key="voice_confirm_qty"
+            )
+            voice_price = vc2.number_input(
+                "Sale price per jersey ($)",
+                min_value=0.0,
+                value=float(parsed.get("sale_price_each", 0) or 0),
+                step=1.0,
+                key="voice_confirm_price"
+            )
+            voice_fees = vc1.number_input(
+                "Fees ($)",
+                min_value=0.0,
+                value=float(parsed.get("fees", 0) or 0),
+                step=0.5,
+                key="voice_confirm_fees"
+            )
+            voice_shipping = vc2.number_input(
+                "Shipping ($)",
+                min_value=0.0,
+                value=float(parsed.get("shipping_cost", 0) or 0),
+                step=0.5,
+                key="voice_confirm_shipping"
+            )
+            voice_notes = st.text_input(
+                "Notes",
+                value=str(parsed.get("notes", "") or ""),
+                key="voice_confirm_notes"
+            )
+
+            selected_voice_lots = voice_product_stock[
+                voice_product_stock["size"].fillna("").astype(str).str.upper()
+                == normalize_size(voice_size)
+            ]
+            voice_weighted_cost = float(
+                (
+                    selected_voice_lots["quantity_in_stock"]
+                    * selected_voice_lots["unit_cost"]
+                ).sum()
+                / int(selected_voice_lots["quantity_in_stock"].sum())
+            )
+
+            voice_profit = (
+                voice_qty * voice_price
+                - voice_qty * voice_weighted_cost
+                - voice_fees
+                - voice_shipping
+            )
+            st.metric("Estimated profit", f"${voice_profit:,.2f}")
+
+            confirm_col, cancel_col = st.columns(2)
+
+            if confirm_col.button(
+                "✅ Confirm & record sale",
+                type="primary",
+                key="confirm_voice_sale"
+            ):
+                try:
+                    add_sale_for_product_size(
+                        voice_product_row,
+                        voice_size,
+                        voice_qty,
+                        voice_price,
+                        voice_fees,
+                        voice_shipping,
+                        voice_notes
+                    )
+                    st.session_state.pop("voice_sale_parsed", None)
+                    st.session_state.pop("voice_sale_transcript", None)
+                    st.success(
+                        f"Sale recorded: {voice_qty} × {voice_size} "
+                        f"{product_label(voice_product_row)} at ${voice_price:.2f} each."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+            if cancel_col.button("Cancel voice sale", key="cancel_voice_sale"):
+                st.session_state.pop("voice_sale_parsed", None)
+                st.session_state.pop("voice_sale_transcript", None)
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Manual sale entry")
 
         product_options = {
             f"{product_label(r)} [{idx + 1}]": idx
