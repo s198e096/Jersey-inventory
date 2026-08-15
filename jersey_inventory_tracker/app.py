@@ -500,14 +500,59 @@ with tabs[0]:
         )
         st.bar_chart(by_team.set_index("team")[["revenue", "profit"]])
 
-    st.subheader("Low / sold-out stock")
-    if inv.empty:
-        st.info("No inventory yet.")
+    st.subheader("Business trend")
+    chart_c1, chart_c2 = st.columns(2)
+    chart_period = chart_c1.selectbox("Group by", ["Monthly", "Yearly"], key="dashboard_chart_period")
+    chart_metric = chart_c2.selectbox(
+        "Show",
+        ["Quantity sold", "Profit made", "Available stock quantity"],
+        key="dashboard_chart_metric"
+    )
+    freq = "ME" if chart_period == "Monthly" else "YE"
+
+    if chart_metric in ["Quantity sold", "Profit made"]:
+        if sales.empty:
+            st.info("No sales recorded yet.")
+        else:
+            chart_df = sales.copy()
+            chart_df["sold_at"] = pd.to_datetime(chart_df["sold_at"], errors="coerce")
+            chart_df = chart_df.dropna(subset=["sold_at"])
+            if chart_df.empty:
+                st.info("No dated sales are available for this chart.")
+            else:
+                value_col = "quantity" if chart_metric == "Quantity sold" else "profit"
+                trend = chart_df.set_index("sold_at")[value_col].resample(freq).sum().fillna(0)
+                trend.name = "Quantity sold" if chart_metric == "Quantity sold" else "Profit made ($)"
+                trend.index = trend.index.strftime("%b %Y" if chart_period == "Monthly" else "%Y")
+                st.bar_chart(trend)
     else:
-        low = inv[inv["quantity_in_stock"] <= 2][
-            ["id", "team", "player_name", "jersey_number", "size", "quantity_in_stock", "unit_cost"]
-        ]
-        st.dataframe(low, use_container_width=True, hide_index=True)
+        if inv.empty:
+            st.info("No inventory yet.")
+        else:
+            stock_events = []
+            inv_events = inv.copy()
+            inv_events["created_at"] = pd.to_datetime(inv_events["created_at"], errors="coerce")
+            inv_events = inv_events.dropna(subset=["created_at"])
+            for _, row in inv_events.iterrows():
+                stock_events.append({"date": row["created_at"], "change": int(row["quantity_received"])})
+
+            if not sales.empty:
+                sale_events = sales.copy()
+                sale_events["sold_at"] = pd.to_datetime(sale_events["sold_at"], errors="coerce")
+                sale_events = sale_events.dropna(subset=["sold_at"])
+                for _, row in sale_events.iterrows():
+                    stock_events.append({"date": row["sold_at"], "change": -int(row["quantity"])})
+
+            if not stock_events:
+                st.info("No dated inventory history is available for this chart.")
+            else:
+                events = pd.DataFrame(stock_events).sort_values("date")
+                stock_trend = events.set_index("date")["change"].resample(freq).sum().cumsum()
+                if not stock_trend.empty:
+                    stock_trend = stock_trend + (units_in_stock - int(stock_trend.iloc[-1]))
+                stock_trend.name = "Available stock quantity"
+                stock_trend.index = stock_trend.index.strftime("%b %Y" if chart_period == "Monthly" else "%Y")
+                st.line_chart(stock_trend)
 
 with tabs[1]:
     st.subheader("Upload a supplier order sheet")
