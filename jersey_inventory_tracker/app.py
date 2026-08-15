@@ -7,6 +7,7 @@ import base64
 from datetime import datetime
 
 import pandas as pd
+import altair as alt
 import streamlit as st
 from PIL import Image
 
@@ -524,7 +525,35 @@ with tabs[0]:
                 trend = chart_df.set_index("sold_at")[value_col].resample(freq).sum().fillna(0)
                 trend.name = "Quantity sold" if chart_metric == "Quantity sold" else "Profit made ($)"
                 trend.index = trend.index.strftime("%b %Y" if chart_period == "Monthly" else "%Y")
-                st.bar_chart(trend)
+
+                trend_df = trend.reset_index()
+                trend_df.columns = ["Period", "Value"]
+
+                value_format = ",.0f" if chart_metric == "Quantity sold" else "$,.2f"
+                y_title = "Quantity sold" if chart_metric == "Quantity sold" else "Profit made ($)"
+
+                bars = alt.Chart(trend_df).mark_bar().encode(
+                    x=alt.X("Period:N", sort=None, title=None),
+                    y=alt.Y("Value:Q", title=y_title),
+                    tooltip=[
+                        alt.Tooltip("Period:N", title="Period"),
+                        alt.Tooltip("Value:Q", title=chart_metric, format=value_format),
+                    ],
+                )
+
+                labels = alt.Chart(trend_df).mark_text(
+                    dy=-10,
+                    fontWeight="bold"
+                ).encode(
+                    x=alt.X("Period:N", sort=None),
+                    y=alt.Y("Value:Q"),
+                    text=alt.Text("Value:Q", format=value_format),
+                )
+
+                st.altair_chart(
+                    (bars + labels).properties(height=360),
+                    use_container_width=True
+                )
     else:
         if inv.empty:
             st.info("No inventory yet.")
@@ -625,57 +654,75 @@ with tabs[2]:
     if inv.empty:
         st.info("No inventory yet.")
     else:
-        search = st.text_input("Search inventory", placeholder="e.g. Ronaldo, Barcelona, XL")
-        view = inv.copy()
-        if search:
-            q = search.lower()
-            mask = view.astype(str).apply(
-                lambda row: row.str.lower().str.contains(q, regex=False).any(), axis=1
+        # Main inventory view should represent only what is physically in stock.
+        in_stock = inv[inv["quantity_in_stock"] > 0].copy()
+
+        if in_stock.empty:
+            st.info("No jerseys are currently in stock.")
+        else:
+            search = st.text_input(
+                "Search inventory",
+                placeholder="e.g. Ronaldo, Barcelona, XL"
             )
-            view = view[mask]
 
-        st.markdown("#### Stock by size")
-        size_summary = inventory_by_size(view)
-        st.dataframe(
-            size_summary,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "inventory_value": st.column_config.NumberColumn(format="$%.2f"),
-            }
-        )
+            view = in_stock.copy()
 
-        with st.expander("Show detailed purchase lots"):
-            cols = [
-                "id", "team", "player_name", "jersey_number", "version", "size",
-                "quantity_received", "quantity_sold", "quantity_in_stock",
-                "unit_cost", "line_cost", "source_file", "created_at"
-            ]
+            if search:
+                q = search.lower()
+                searchable_cols = ["team", "player_name", "version", "size"]
+                mask = view[searchable_cols].fillna("").astype(str).apply(
+                    lambda row: row.str.lower().str.contains(q, regex=False).any(),
+                    axis=1
+                )
+                view = view[mask]
+
+            # Aggregate purchase lots so the user sees one clean row per
+            # team/player/version/size combination currently in stock.
+            display_cols = ["team", "player_name", "version", "size"]
+            stock_view = (
+                view.groupby(display_cols, dropna=False, as_index=False)
+                .agg(quantity_in_stock=("quantity_in_stock", "sum"))
+                .sort_values(["team", "player_name", "version", "size"])
+            )
+
             st.dataframe(
-                view[cols],
+                stock_view[
+                    ["team", "player_name", "version", "size", "quantity_in_stock"]
+                ],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "unit_cost": st.column_config.NumberColumn(format="$%.2f"),
-                    "line_cost": st.column_config.NumberColumn(format="$%.2f"),
+                    "team": st.column_config.TextColumn("Team"),
+                    "player_name": st.column_config.TextColumn("Player Name"),
+                    "version": st.column_config.TextColumn("Version"),
+                    "size": st.column_config.TextColumn("Size"),
+                    "quantity_in_stock": st.column_config.NumberColumn(
+                        "Quantity In Stock",
+                        format="%d"
+                    ),
                 }
             )
 
-        csv = view[cols].to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download inventory CSV",
-            data=csv,
-            file_name="jersey_inventory.csv",
-            mime="text/csv"
-        )
+            csv = stock_view[
+                ["team", "player_name", "version", "size", "quantity_in_stock"]
+            ].to_csv(index=False).encode("utf-8")
 
+            st.download_button(
+                "Download inventory CSV",
+                data=csv,
+                file_name="jersey_inventory.csv",
+                mime="text/csv"
+            )
+
+        # Management tools still use the complete underlying inventory,
+        # including sold-out lots where needed for historical safety checks.
         with st.expander("Split / Edit Sizes for existing inventory"):
             st.write(
                 "Use this for older inventory that was saved with combined sizes such as "
                 "`S/M/L`. The quantities you enter must add up to the original lot quantity."
             )
 
-            unsold = view[view["quantity_sold"] == 0].copy()
+            unsold = inv[inv["quantity_sold"] == 0].copy()
             if unsold.empty:
                 st.info("There are no unsold inventory lots available to split.")
             else:
@@ -746,7 +793,11 @@ with tabs[2]:
 
         with st.expander("Delete an inventory lot"):
             st.warning("Only lots with no recorded sales can be deleted.")
-            delete_id = st.number_input("Inventory ID to delete", min_value=1, step=1)
+            delete_id = st.number_input(
+                "Inventory ID to delete",
+                min_value=1,
+                step=1
+            )
             if st.button("Delete inventory lot"):
                 try:
                     delete_inventory_row(int(delete_id))
@@ -754,6 +805,7 @@ with tabs[2]:
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
+
 
 with tabs[3]:
     st.subheader("Record a sale")
