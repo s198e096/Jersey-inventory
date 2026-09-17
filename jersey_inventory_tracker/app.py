@@ -647,6 +647,57 @@ with tabs[1]:
                 st.success(f"Added {len(cleaned)} inventory lot(s).")
                 st.rerun()
 
+
+    st.divider()
+    st.subheader("Add jersey manually")
+    st.caption("Add inventory without uploading a supplier order sheet.")
+
+    with st.form("manual_inventory_form", clear_on_submit=True):
+        m1, m2 = st.columns(2)
+        with m1:
+            manual_team = st.text_input("Team *", placeholder="e.g. Real Madrid")
+            manual_player = st.text_input("Player name", placeholder="e.g. Ronaldo")
+            manual_number = st.text_input("Jersey number", placeholder="e.g. 7")
+            manual_version = st.text_input("Version", placeholder="e.g. Home, Away, Third")
+        with m2:
+            manual_size = st.selectbox("Size *", ["XS", "S", "M", "L", "XL", "XXL", "XXXL"])
+            manual_qty = st.number_input("Quantity *", min_value=1, value=1, step=1)
+            manual_unit_cost = st.number_input("Unit cost ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            manual_order_number = st.text_input("Order number", placeholder="Optional")
+
+        manual_notes = st.text_input("Notes", placeholder="Optional")
+        add_manual = st.form_submit_button("Add jersey to inventory", type="primary")
+
+    if add_manual:
+        if not manual_team.strip():
+            st.error("Team is required.")
+        else:
+            try:
+                now = datetime.now().isoformat(timespec="seconds")
+                qty = int(manual_qty)
+                unit_cost = float(manual_unit_cost)
+                row = {
+                    "created_at": now,
+                    "import_batch": f"manual-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                    "source_file": "Manual entry",
+                    "order_number": manual_order_number.strip(),
+                    "version": manual_version.strip(),
+                    "team": manual_team.strip(),
+                    "player_name": manual_player.strip(),
+                    "jersey_number": manual_number.strip(),
+                    "size": normalize_size(manual_size),
+                    "quantity_received": qty,
+                    "unit_cost": unit_cost,
+                    "line_cost": qty * unit_cost,
+                    "notes": manual_notes.strip(),
+                }
+                get_supabase().table("inventory").insert(row).execute()
+                st.success(f"Added {qty} × {manual_team.strip()} {manual_player.strip()} ({manual_size}) to inventory.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not add inventory: {e}")
+
+
 with tabs[2]:
     st.subheader("Current inventory")
     inv = read_inventory()
