@@ -489,7 +489,7 @@ with tabs[0]:
     c4.metric("Sales revenue", f"${revenue:,.2f}")
     c5.metric("Realized profit", f"${profit:,.2f}")
 
-    st.subheader("Profit by team")
+    st.subheader("Top 5 teams by profit")
     if sales.empty:
         st.info("No sales recorded yet.")
     else:
@@ -498,6 +498,7 @@ with tabs[0]:
             .groupby("team", as_index=False)[["revenue", "profit"]]
             .sum()
             .sort_values("profit", ascending=False)
+            .head(5)
         )
         st.bar_chart(by_team.set_index("team")[["revenue", "profit"]])
 
